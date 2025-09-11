@@ -106,9 +106,6 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
     if config is None:
         config = {}
 
-    if config.get("disable", False):
-        return None
-
     # Check if this is a VLA model by looking for language_model attribute
     is_vla_model = hasattr(module, "language_model")
 
@@ -205,9 +202,7 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         return functools.partial(_or_policy, policies=policies)
 
 
-def apply_fsdp2_to_model(
-    module, config=None, fsdp_kwargs=None, is_vla_model=False, is_lora=False
-):
+def apply_fsdp2_to_model(module, config=None, fsdp_kwargs=None):
     """
     FSDP2 version of module sharding application, corresponding to FSDP1's auto_wrap_policy logic
 
@@ -215,8 +210,6 @@ def apply_fsdp2_to_model(
         module: The model to be sharded
         config: Configuration dictionary
         fsdp_kwargs: FSDP2 parameters
-        is_vla_model: Whether to enable VLA-specific wrapping
-        is_lora: Whether to enable LoRA-specific wrapping
 
     Returns:
         The sharded model
@@ -226,9 +219,6 @@ def apply_fsdp2_to_model(
 
     if fsdp_kwargs is None:
         fsdp_kwargs = {}
-
-    if config.get("disable", False):
-        return module
 
     if hasattr(module, "language_model"):
         default_transformer_cls_names_to_wrap = getattr(
@@ -259,35 +249,6 @@ def apply_fsdp2_to_model(
             and not getattr(module.config, "tie_word_embeddings", False)
         ):
             modules_to_shard.append((name, submodule, "transformer_or_embedding"))
-
-    if is_vla_model:
-        from timm.models.vision_transformer import VisionTransformer
-
-        for name, submodule in module.named_modules():
-            if isinstance(submodule, VisionTransformer):
-                modules_to_shard.append((name, submodule, "vision_transformer"))
-
-        from prismatic.extern.hf.modeling_prismatic import PrismaticProjector
-
-        for name, submodule in module.named_modules():
-            if isinstance(submodule, PrismaticProjector):
-                modules_to_shard.append((name, submodule, "prismatic_projector"))
-
-        if hasattr(module, "value_head"):
-            from rlinf.models.embodiment.modules.value_head import ValueHead
-
-            for name, submodule in module.named_modules():
-                if isinstance(submodule, ValueHead):
-                    modules_to_shard.append((name, submodule, "value_head"))
-
-    if is_lora:
-        for name, submodule in module.named_modules():
-            if (
-                len(list(submodule.named_children())) == 0
-                and getattr(submodule, "weight", None) is not None
-                and submodule.weight.requires_grad
-            ):
-                modules_to_shard.append((name, submodule, "lora"))
 
     for name, submodule, module_type in modules_to_shard:
         fully_shard(submodule, **fsdp_kwargs)

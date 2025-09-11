@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 
 from omegaconf.dictconfig import DictConfig
@@ -91,7 +92,13 @@ class EmbodiedRunner:
 
     def run(self):
         start_step = self.global_step
-        for _step in tqdm(range(start_step, self.max_steps), ncols=120):
+        global_pbar = tqdm(
+            initial=start_step,
+            total=self.max_steps,
+            desc="Global Step",
+            ncols=620,
+        )
+        for _step in global_pbar:
             if (
                 _step % self.cfg.runner.val_check_interval == 0
                 and self.cfg.runner.val_check_interval > 0
@@ -133,6 +140,10 @@ class EmbodiedRunner:
 
             time_metrics = self.timer.consume_durations()
 
+            logging_metrics = time_metrics
+            logging_metrics.update(actor_rollout_metrics[0])
+            logging_metrics.update(actor_training_metrics[0])
+
             rollout_metrics = {
                 f"rollout/{k}": v for k, v in actor_rollout_metrics[0].items()
             }
@@ -143,6 +154,15 @@ class EmbodiedRunner:
             self.metric_logger.log(rollout_metrics, _step)
             self.metric_logger.log(time_metrics, _step)
             self.metric_logger.log(training_metrics, _step)
+
+            global_pbar.set_postfix(logging_metrics)
+            global_pbar.update(1)
+
+            if is_train_end:
+                logging.info(
+                    f"Step limit given by max_steps={self.max_steps} reached. Stopping run"
+                )
+                return
 
         self.metric_logger.finish()
 

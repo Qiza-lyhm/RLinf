@@ -137,8 +137,14 @@ actor:
     
     # Wrap policy configuration for module sharding
     wrap_policy:
-      # Whether to disable automatic module wrapping
-      disable: false
+      # transformer layer classes to wrap, null means default wrapping
+      transformer_layer_cls_to_wrap: null
+
+    # Mixed precision configuration
+    mixed_precision:
+      param_dtype: "bf16"
+      reduce_dtype: "fp32"
+      buffer_dtype: "fp32"
 
   tokenizer:
     tokenizer_type: "HuggingFaceTokenizer"
@@ -149,7 +155,6 @@ actor:
 
   model:
     model_name: "openvla"
-    is_vla_model: True
     action_dim: 7
     num_action_chunks: 1
     use_proprio: False

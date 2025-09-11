@@ -182,8 +182,6 @@ class FSDPModelManager:
                 module=module,
                 config=self._cfg.fsdp_config,
                 fsdp_kwargs=fsdp_kwargs,
-                is_vla_model=self._cfg.model.get("is_vla_model", False),
-                is_lora=self._cfg.model.get("is_lora", False),
             )
             fsdp2_load_full_state_dict(module, full_state, cpu_offload)
 

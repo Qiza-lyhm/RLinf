@@ -18,7 +18,6 @@ import os
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from tqdm import tqdm
 
 from rlinf.algorithms.embodiment.utils import (
     actor_loss_fn,
@@ -289,9 +288,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
 
         metrics = {}
-        for _, train_global_batch in tqdm(
-            enumerate(rollout_dataloader_iter), desc="get loss and metrics"
-        ):
+        for train_global_batch in rollout_dataloader_iter:
             # split batch into micro_batches
             train_global_batch_size = train_global_batch["input_ids"].shape[0]
             assert (
