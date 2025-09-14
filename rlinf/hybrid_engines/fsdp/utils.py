@@ -28,12 +28,13 @@
 
 import functools
 from contextlib import nullcontext
+from typing import Dict, Union
 
 import torch
 from accelerate import init_empty_weights
 from packaging import version
 from prismatic.extern.hf.modeling_prismatic import PrismaticProjector
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
@@ -41,18 +42,27 @@ from torch.distributed.fsdp.wrap import (
 from torch.optim import Optimizer
 from transformers.trainer_pt_utils import get_module_class_from_name
 
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    from torch.distributed._tensor import DTensor
+
 if version.parse(torch.__version__) >= version.parse("2.6"):
     from torch.distributed.fsdp import (
+        CPUOffloadPolicy,
         FSDPModule,
+        MixedPrecisionPolicy,
         fully_shard,
     )
 elif version.parse(torch.__version__) >= version.parse("2.4"):
     from torch.distributed._composable.fsdp import (
+        CPUOffloadPolicy,
         FSDPModule,
+        MixedPrecisionPolicy,
         fully_shard,
     )
 else:
-    fully_shard, FSDPModule = None, None
+    raise ImportError(f"Unsupport torch version: {version.parse(torch.__version__)}")
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -202,7 +212,14 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         return functools.partial(_or_policy, policies=policies)
 
 
-def apply_fsdp2_to_model(module, config=None, fsdp_kwargs=None):
+def apply_fsdp2_to_model(
+    module,
+    config: Dict,
+    device_mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy,
+    offload_policy: CPUOffloadPolicy,
+    reshard_after_forward: bool,
+):
     """
     FSDP2 version of module sharding application, corresponding to FSDP1's auto_wrap_policy logic
 
@@ -216,9 +233,6 @@ def apply_fsdp2_to_model(module, config=None, fsdp_kwargs=None):
     """
     if config is None:
         config = {}
-
-    if fsdp_kwargs is None:
-        fsdp_kwargs = {}
 
     if hasattr(module, "language_model"):
         default_transformer_cls_names_to_wrap = getattr(
@@ -251,11 +265,21 @@ def apply_fsdp2_to_model(module, config=None, fsdp_kwargs=None):
             modules_to_shard.append((name, submodule, "transformer_or_embedding"))
 
     for name, submodule, module_type in modules_to_shard:
-        fully_shard(submodule, **fsdp_kwargs)
+        fully_shard(
+            submodule,
+            mesh=device_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            reshard_after_forward=reshard_after_forward,
+        )
 
-    fully_shard(module, **fsdp_kwargs)
-
-    return module
+    return fully_shard(
+        module,
+        mesh=device_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=False,
+    )
 
 
 def fsdp2_load_full_state_dict(
@@ -307,6 +331,34 @@ def get_fsdp_state_ctx(model, state_type, state_cfg, optim_cfg):
         return nullcontext()
 
 
+def get_fsdp2_full_state_dict_all_ranks(
+    model: torch.nn.Module, offload_to_cpu: bool = True
+):
+    """
+    Get the full state dict for all ranks
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP2
+
+    with FSDP2.summon_full_params(model, writeback=False):
+        state_dict = model.state_dict()
+        clean_state_dict = {}
+        device = (
+            torch.device("cpu") if offload_to_cpu else next(model.parameters()).device
+        )
+
+        for key, value in state_dict.items():
+            if isinstance(value, torch.Tensor):
+                clean_value = (
+                    value.to(device, non_blocking=True).full_tensor()
+                    if hasattr(value, "full_tensor")
+                    else value.to(device, non_blocking=True)
+                )
+                clean_state_dict[key] = clean_value
+            else:
+                clean_state_dict[key] = value
+        return clean_state_dict
+
+
 def get_fsdp_full_state_dict(
     model: torch.nn.Module, offload_to_cpu: bool = True, rank0_only: bool = True
 ):
@@ -339,26 +391,21 @@ def get_fsdp_full_state_dict(
             state_dict = model.state_dict()
         return state_dict
     elif fsdp_version(model) == 2:
-        from torch.distributed.checkpoint.state_dict import (
-            StateDictOptions,
-            get_model_state_dict,
-        )
+        if rank0_only:
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                get_model_state_dict,
+            )
 
-        state_dict_config = StateDictOptions(
-            full_state_dict=True,
-            cpu_offload=offload_to_cpu,
-            broadcast_from_rank0=not rank0_only,
-        )
-        state_dict = get_model_state_dict(model, options=state_dict_config)
-        if not rank0_only:
-            if torch.distributed.get_rank() == 0:
-                obj_list = [state_dict]
-            else:
-                obj_list = [None]
-
-            torch.distributed.broadcast_object_list(obj_list, src=0)
-            state_dict = obj_list[0]
-        return state_dict
+            state_dict_config = StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=offload_to_cpu,
+                broadcast_from_rank0=False,
+            )
+            state_dict = get_model_state_dict(model, options=state_dict_config)
+            return state_dict
+        else:
+            return get_fsdp2_full_state_dict_all_ranks(model, offload_to_cpu)
     else:
         raise NotImplementedError(f"Unknown FSDP version {fsdp_version}")
 
@@ -393,3 +440,115 @@ def get_lr_scheduler(
         )
     else:
         raise NotImplementedError(f"Scheduler type {warmup_style} is not supported")
+
+
+def to_local_if_dtensor(tensor: Union[torch.Tensor, DTensor]) -> torch.Tensor:
+    """Returns the local shard of the given tensor if it is a DTensor.
+
+    Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/605f618f237cda8fa80132bc2ccff933512d5a0d/megatron/core/utils.py#L746
+    """
+    with torch.no_grad():
+        return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+@torch.no_grad()
+def clip_grad_by_total_norm_(
+    parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
+    max_grad_norm: Union[int, float],
+    total_norm: float,
+    dtype: torch.dtype = torch.float32,
+):
+    """Clips gradient of an iterable of parameters by total norm.
+
+    Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/a695b2bd2a0ca9ca63385a48c41a1c5a033cdd1e/megatron/core/optimizer/clip_grads.py#L138
+
+    Note that the gradients are modified in place.
+
+    Args:
+        parameters (Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]]):
+            An iterable of Tensors or DTensors, or a single Tensor or DTensor
+            that will have gradients normalized.
+        max_grad_norm (Union[float, int]): Maximum norm of the gradients.
+        total_norm (float): The pre-computed total norm of the gradients to use for scaling.
+    """
+    if isinstance(parameters, (torch.Tensor, DTensor)):
+        parameters = [parameters]
+
+    # Grads.
+    grads = [
+        to_local_if_dtensor(p.grad.detach()).to(dtype)
+        for p in parameters
+        if p.grad is not None
+    ]
+
+    # Scale.
+    clip_coeff = max_grad_norm / (total_norm + 1.0e-6)
+
+    if clip_coeff < 1.0:
+        for g in grads:
+            g.mul_(clip_coeff)
+
+
+@torch.no_grad()
+def get_grad_norm(
+    parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
+    dp_group: torch.distributed.ProcessGroup,
+    norm_type: Union[int, float] = 2,
+    dtype: torch.dtype = torch.float32,
+) -> float:
+    """Calculate the norm of gradients.
+
+    Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/a695b2bd2a0ca9ca63385a48c41a1c5a033cdd1e/megatron/core/optimizer/clip_grads.py#L51
+
+    Args:
+        parameters (Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]]):
+            An iterable of Tensors or DTensors, or a single Tensor or DTensor
+            that will have gradient norm calculated.
+        dp_group (torch.distributed.ProcessGroup): Process group for data parallel communication.
+        norm_type (Union[int, float]): Type of the used p-norm. Can be ``'inf'`` for
+            infinity norm.
+
+    Returns:
+        float: Total norm of the gradients (viewed as a single vector)
+    """
+    if isinstance(parameters, (torch.Tensor, DTensor)):
+        parameters = [parameters]
+
+    # Grads.
+    grads_for_norm = [
+        to_local_if_dtensor(p.grad.detach()).to(dtype)
+        for p in parameters
+        if p.grad is not None
+    ]
+
+    # Norm parameters.
+    norm_type = float(norm_type)
+    total_norm = 0.0
+
+    # Calculate norm.
+    if norm_type == torch.inf:
+        total_norm = max(grad.abs().max().item() for grad in grads_for_norm)
+        total_norm_cuda = torch.tensor(
+            [float(total_norm)], dtype=torch.float, device="cuda"
+        )
+        # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
+        if dp_group is not None:
+            torch.distributed.all_reduce(
+                total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=dp_group
+            )
+        total_norm = total_norm_cuda[0].item()
+
+    else:
+        for grad in grads_for_norm:
+            grad_norm = torch.norm(grad, norm_type)
+            total_norm += grad_norm**norm_type
+
+        total_norm = total_norm.cuda()  # type: ignore
+        # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
+        if dp_group is not None:
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_group
+            )
+        total_norm = total_norm.item() ** (1.0 / norm_type)  # type: ignore
+
+    return total_norm

@@ -28,17 +28,19 @@ from torch.distributed.fsdp import (
     ShardingStrategy,
     StateDictType,
 )
+from torch.distributed.tensor import DTensor
 from transformers import AutoModelForCausalLM
 
 from rlinf.config import torch_dtype_from_precision
 from rlinf.hybrid_engines.fsdp.utils import (
     apply_fsdp2_to_model,
+    clip_grad_by_total_norm_,
     create_device_mesh,
-    fsdp2_load_full_state_dict,
     fsdp_version,
     get_fsdp_full_state_dict,
     get_fsdp_state_ctx,
     get_fsdp_wrap_policy,
+    get_grad_norm,
     get_lr_scheduler,
     init_fn,
 )
@@ -86,6 +88,12 @@ class FSDPModelManager:
         self.device_mesh = create_device_mesh(
             world_size, self._cfg.fsdp_config.get("fsdp_size", -1)
         )
+        self.dp_group = (
+            self.device_mesh["ddp"].get_group()
+            if "ddp" in self.device_mesh.mesh_dim_names
+            else None
+        )
+
         self.world_size = torch.distributed.get_world_size()
         self.rank = torch.distributed.get_rank()
 
@@ -167,23 +175,22 @@ class FSDPModelManager:
                 reduce_dtype=self.reduce_dtype,
                 cast_forward_inputs=True,
             )
-            cpu_offload = None
+            offload_policy = (
+                CPUOffloadPolicy(pin_memory=False)
+                if self._cfg.fsdp_config.get("cpu_offload", False)
+                else None
+            )
 
-            fsdp_kwargs = {
-                "mesh": self.device_mesh,
-                "mp_policy": mp_policy,
-                "offload_policy": cpu_offload,
-                "reshard_after_forward": self._cfg.fsdp_config.get(
-                    "reshard_after_forward", False
-                ),
-            }
-            full_state = module.state_dict()
-            apply_fsdp2_to_model(
+            self.model = apply_fsdp2_to_model(
                 module=module,
                 config=self._cfg.fsdp_config,
-                fsdp_kwargs=fsdp_kwargs,
+                device_mesh=self.device_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                reshard_after_forward=self._cfg.fsdp_config.get(
+                    "reshard_after_forward", True
+                ),
             )
-            fsdp2_load_full_state_dict(module, full_state, cpu_offload)
 
             self.model = module
         else:
@@ -247,22 +254,32 @@ class FSDPModelManager:
         if fsdp_version(self.model) == 1:
             grad_norm = self.model.clip_grad_norm_(max_norm=self._cfg.optim.clip_grad)
         else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_norm=self._cfg.optim.clip_grad
+            grad_norm = get_grad_norm(
+                self.model.parameters(),
+                dp_group=self.dp_group,
+                dtype=torch.float32,
             )
-            grad_norm = grad_norm.to_local()
+            if self._cfg.optim.clip_grad is not None:
+                clip_grad_by_total_norm_(
+                    self.model.parameters(),
+                    max_grad_norm=self._cfg.optim.clip_grad,
+                    total_norm=grad_norm,
+                    dtype=torch.float32,
+                )
+            grad_norm = torch.tensor([grad_norm])
 
         # if grad_norm is not finite, skip the update
-        success = True
+        success = 1
         if not torch.isfinite(grad_norm):
             self._logger.warning(
                 f"[Rank {torch.distributed.get_rank()}] grad_norm is not finite: {grad_norm}"
             )
             self.optimizer.zero_grad()
-            success = False
+            success = 0
         else:
             self.optimizer.step()
 
+        # TODO: lr scheduler step after all rollout batches are processed
         lr = self.lr_scheduler.get_last_lr()
 
         self.lr_scheduler.step()
@@ -413,6 +430,11 @@ class FSDPModelManager:
         clear_memory()
 
     def offload_fsdp_param_and_grad(self, offload_grad=False):
+        if fsdp_version(self.model) == 2:
+            self.model = self.model.to("cpu")
+            clear_memory()
+            return
+
         for _, param in self.model.named_parameters():
             if hasattr(param, "_handle") and param._handle is not None:
                 flat_param = param._handle.flat_param
@@ -437,6 +459,11 @@ class FSDPModelManager:
         clear_memory()
 
     def load_fsdp_param_and_grad(self, device_id, load_grad=False):
+        if fsdp_version(self.model) == 2:
+            self.model = self.model.to("cuda")
+            clear_memory()
+            return
+
         for _, param in self.model.named_parameters():
             if hasattr(param, "_handle") and param._handle is not None:
                 flat_param = param._handle.flat_param
@@ -467,7 +494,7 @@ class FSDPModelManager:
             for param in param_group["params"]:
                 state = self.optimizer.state[param]
                 for key, value in state.items():
-                    if isinstance(value, torch.Tensor):
+                    if isinstance(value, (DTensor, torch.Tensor)):
                         state[key] = value.to("cpu", non_blocking=True)
         clear_memory()
 
@@ -478,6 +505,6 @@ class FSDPModelManager:
             for param in param_group["params"]:
                 state = self.optimizer.state[param]
                 for key, value in state.items():
-                    if isinstance(value, torch.Tensor):
+                    if isinstance(value, (DTensor, torch.Tensor)):
                         state[key] = value.to(device_id, non_blocking=True)
         clear_memory()
